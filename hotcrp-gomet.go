@@ -12,7 +12,8 @@ import (
 	"time"
 )
 
-const siteStatusTimeout = 120 * time.Second
+//const siteStatusTimeout = 120 * time.Second
+const siteStatusTimeout = 10 * time.Second
 const siteErrorStatusTimeout = 5 * time.Second
 
 type Site struct {
@@ -25,15 +26,21 @@ type Site struct {
 	statusSetAt time.Time
 
 	mu sync.Mutex
+	statusRefreshing bool
 	statusWaiters []chan<- string
+	statusInterest int
 }
 
-func (site *Site) statusExpired() bool {
+func (site *Site) statusExpiry() time.Time {
 	timeout := time.Duration(siteStatusTimeout)
 	if site.status == "" {
 		timeout = time.Duration(siteErrorStatusTimeout)
 	}
-	return time.Now().After(site.statusSetAt.Add(timeout))
+	return site.statusSetAt.Add(timeout)
+}
+
+func (site *Site) statusExpired() bool {
+	return time.Now().After(site.statusExpiry())
 }
 
 type TrackerStatusResponse struct {
@@ -43,55 +50,110 @@ type TrackerStatusResponse struct {
 	Sequencer float64 `json:"tracker_status_at"`
 }
 
-func (site *Site) Status(ch chan<- string) {
+func (site *Site) renewStatus() {
 	site.mu.Lock()
+	if !site.statusRefreshing {
+		site.statusRefreshing = true
 
-	if !site.statusExpired() {
-		ch <- site.status
 		site.mu.Unlock()
-		return
-	}
-
-	if site.statusWaiters != nil {
-		site.statusWaiters = append(site.statusWaiters, ch)
-		site.mu.Unlock()
-		return
-	}
-
-	site.statusWaiters = make([]chan<- string, 0, 1)
-	site.statusWaiters = append(site.statusWaiters, ch)
-	apiurl := site.siteurl + "api.php?fn=trackerstatus"
-	site.mu.Unlock()
-
-	go func() {
-		resp, err := http.Get(apiurl)
+		resp, err := http.Get(site.siteurl + "api.php?fn=trackerstatus")
 		var respbody []byte
 		if err == nil {
 			respbody, err = ioutil.ReadAll(resp.Body)
 		}
+		fmt.Printf("%sapi/trackerstatus -> %s\n", site.siteurl, string(respbody))
 		statusResponse := TrackerStatusResponse{}
 		if err == nil {
 			err = json.Unmarshal(respbody, &statusResponse)
 		}
 		site.mu.Lock()
+
 		site.status = ""
+		site.statusError = err
 		site.statusSetAt = time.Now()
 		if err != nil {
-			site.statusError = err
+			// already have tracked error
 		} else if !statusResponse.Ok {
 			site.statusError = fmt.Errorf("%s", statusResponse.Error)
-		} else if statusResponse.Sequencer < site.statusSequencer {
+		} else if site.status != "" && statusResponse.Sequencer < site.statusSequencer {
 			// ignore out-of-sequence response
 		} else {
 			site.status = statusResponse.TrackerStatus
 			site.statusSequencer = statusResponse.Sequencer
 		}
-		for _, ch = range site.statusWaiters {
+
+		for _, ch := range site.statusWaiters {
 			ch <- site.status
 		}
-		site.statusWaiters = nil
-		site.mu.Unlock()
-	}()
+		site.statusWaiters = site.statusWaiters[0:0]
+
+		site.statusRefreshing = false
+	}
+	site.mu.Unlock()
+}
+
+func (site *Site) statusLoop() {
+	for {
+		site.mu.Lock()
+		if site.statusInterest == 0 {
+			site.mu.Unlock()
+			return
+		}
+
+		expiry := site.statusExpiry().Add(-2 * time.Second)
+		now := time.Now()
+		if now.Before(expiry) {
+			site.mu.Unlock()
+			<-time.After(expiry.Sub(now))
+		} else {
+			ch := make(chan string)
+			site.statusWaiters = append(site.statusWaiters, ch)
+			site.mu.Unlock()
+			go site.renewStatus()
+			<-ch
+		}
+	}
+}
+
+func (site *Site) Status() <-chan string {
+	ch := make(chan string, 1)
+	site.mu.Lock()
+	if site.statusExpired() {
+		site.statusWaiters = append(site.statusWaiters, ch)
+		go site.renewStatus()
+	} else {
+		ch <- site.status
+	}
+	site.mu.Unlock()
+	return ch
+}
+
+func (site *Site) DifferentStatus(status string) <-chan string {
+	ch := make(chan string, 1)
+	site.mu.Lock()
+	if site.statusExpired() || site.status == status {
+		site.statusInterest++
+		if site.statusInterest == 1 {
+			go site.statusLoop()
+		}
+		go func() {
+			lch := make(chan string)
+			site.mu.Lock()
+			for site.statusExpired() || site.status == status {
+				site.statusWaiters = append(site.statusWaiters, lch)
+				site.mu.Unlock()
+				<-lch
+				site.mu.Lock()
+			}
+			site.statusInterest--
+			ch <- site.status
+			site.mu.Unlock()
+		}()
+	} else {
+		ch <- site.status
+	}
+	site.mu.Unlock()
+	return ch
 }
 
 
@@ -126,6 +188,7 @@ func LookupSite(s, host string) (*Site, error) {
 		site = new(Site)
 		site.siteurl = siteurl
 		site.createAt = now
+		site.statusWaiters = make([]chan<- string, 0, 8)
 		sitemap[siteurl] = site
 	}
 	site.accessAt = now
@@ -145,10 +208,12 @@ func SiteRequest(w http.ResponseWriter, req *http.Request) {
 	var result SiteResponse
 	if site, err := LookupSite(req.FormValue("conference"), req.Host); err != nil {
 		result.Error = err.Error()
+	} else if poll := req.FormValue("poll"); poll != "" {
+		status := <-site.DifferentStatus(poll)
+		result.Message = "status " + status
+		result.Ok = status != ""
 	} else {
-		ch := make(chan string)
-		site.Status(ch)
-		status := <-ch
+		status := <-site.Status()
 		result.Message = "status " + status
 		result.Ok = status != ""
 	}
