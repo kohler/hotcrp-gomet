@@ -21,6 +21,9 @@ import (
 const siteStatusTimeout = 10 * time.Second
 const siteErrorStatusTimeout = 5 * time.Second
 
+var directoryWatcher func(string)
+
+
 type TrackerSequencer float64
 
 func (seq TrackerSequencer) MarshalJSON() ([]byte, error) {
@@ -78,25 +81,14 @@ func (site *Site) statusLoop(ch <-chan struct{}) {
 		expiry := site.statusExpiry().Add(-2 * time.Second)
 		now := time.Now()
 		var timech <-chan time.Time
-		var statusch <-chan SiteStatus
-		if site.statusInterest == 0 {
-		} else if now.Before(expiry) {
+		if site.statusInterest != 0 && now.Before(expiry) {
 			timech = time.After(expiry.Sub(now))
-		} else {
-			sch := make(chan SiteStatus, 1)
-			site.statusWaiters = append(site.statusWaiters, sch)
-			go site.renewStatus()
-			statusch = sch
 		}
 		site.mu.Unlock()
 
 		select {
 		case <-timech:
-			fmt.Printf("time\n")
-		case <-statusch:
-			fmt.Printf("status\n")
 		case <-ch:
-			fmt.Printf("ping\n")
 		}
 	}
 }
@@ -127,27 +119,29 @@ func (site *Site) renewStatus() {
 		}
 		site.mu.Lock()
 
-		site.status = SiteStatus{"", 0, err}
-		site.statusSetAt = time.Now()
-		if err != nil {
-			// already have tracked error
-		} else if !statusResponse.Ok {
-			site.status.Error = fmt.Errorf("%s", statusResponse.Error)
-		} else if site.status.Status != "" && statusResponse.Sequencer < site.status.Sequencer {
-			// ignore out-of-sequence response
-		} else {
-			site.status.Status = statusResponse.TrackerStatus
-			site.status.Sequencer = statusResponse.Sequencer
+		newStatus := SiteStatus{"", 0, err}
+		if err == nil && statusResponse.Ok {
+			newStatus.Status = statusResponse.TrackerStatus
+			newStatus.Sequencer = statusResponse.Sequencer
+		} else if err == nil {
+			newStatus.Error = fmt.Errorf("%s", statusResponse.Error)
 		}
-
-		for _, ch := range site.statusWaiters {
-			ch <- site.status
-		}
-		site.statusWaiters = site.statusWaiters[0:0]
-
+		site.Update(newStatus)
 		site.statusRefreshing = false
 	}
 	site.mu.Unlock()
+}
+
+func (site *Site) Update(newStatus SiteStatus) {
+	if newStatus.Error != nil || site.status.Status == "" || site.status.Sequencer < newStatus.Sequencer {
+		site.status = newStatus
+	}
+	site.statusSetAt = time.Now()
+	for _, ch := range site.statusWaiters {
+		ch <- site.status
+	}
+	site.statusWaiters = site.statusWaiters[0:0]
+	site.statusLooper <- struct{}{}
 }
 
 func (site *Site) Status() <-chan SiteStatus {
@@ -197,7 +191,7 @@ var (
 	sitemap map[string]*Site = make(map[string]*Site)
 )
 
-func LookupSite(s, host string) (*Site, error) {
+func LookupSite(s, host string, create bool) (*Site, error) {
 	if s == "" {
 		return nil, fmt.Errorf("missing conference")
 	}
@@ -218,11 +212,13 @@ func LookupSite(s, host string) (*Site, error) {
 
 	sitemapmu.Lock()
 	site := sitemap[siteurl]
-	if site == nil {
+	if site == nil && create {
 		site = NewSite(siteurl)
 		sitemap[siteurl] = site
 	}
-	site.accessAt = time.Now()
+	if site != nil {
+		site.accessAt = time.Now()
+	}
 	sitemapmu.Unlock()
 
 	return site, nil
@@ -244,7 +240,8 @@ func SiteRequest(w http.ResponseWriter, req *http.Request) {
 	w.Header().Add("Expires", "Mon, 26 Jul 1997 05:00:00 GMT")
 	var result SiteResponse
 	var status SiteStatus
-	if site, err := LookupSite(req.FormValue("conference"), req.Host); err != nil {
+	site, err := LookupSite(req.FormValue("conference"), req.Host, true)
+	if err != nil {
 		status = SiteStatus{Error: err}
 	} else if poll := req.FormValue("poll"); poll != "" {
 		status = <-site.DifferentStatus(poll)
@@ -284,19 +281,17 @@ func nfilesSet(n int) int {
 func userSet(username string) {
 	u, err := user.Lookup(username)
 	if err != nil {
-		log.Fatalf("%s", err)
+		log.Fatal(err)
 	}
-
 	gid, _ := strconv.Atoi(u.Gid)
 	err = unix.Setgid(gid)
 	if err != nil {
-		log.Fatalf("%s", err)
+		log.Fatal(err)
 	}
-
 	uid, _ := strconv.Atoi(u.Uid)
 	err = unix.Setuid(uid)
 	if err != nil {
-		log.Fatalf("%s", err)
+		log.Fatal(err)
 	}
 }
 
@@ -317,6 +312,10 @@ func main() {
 	flag.StringVar(&user, "user", "", "run as user")
 	flag.StringVar(&user, "u", "", "run as user")
 
+	var watchDirectory string
+	flag.StringVar(&watchDirectory, "update-directory", "", "directory to watch for updates")
+	flag.StringVar(&watchDirectory, "d", "", "directory to watch for updates")
+
 	flag.Parse()
 
 	if nfiles != nfilesReq {
@@ -328,6 +327,12 @@ func main() {
 
 	if user != "" {
 		userSet(user)
+	}
+
+	if watchDirectory != "" && directoryWatcher == nil {
+		log.Fatalf("this platform does not support `--update-directory`")
+	} else if watchDirectory != "" {
+		go directoryWatcher(watchDirectory)
 	}
 
 	if !fg {
