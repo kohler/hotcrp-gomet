@@ -5,10 +5,14 @@ import (
 	"flag"
 	"fmt"
 	"golang.org/x/sys/unix"
+	"io"
 	"io/ioutil"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"os/exec"
 	"os/signal"
 	"os/user"
 	"strconv"
@@ -112,7 +116,7 @@ func (site *Site) renewStatus() {
 		if err == nil {
 			respbody, err = ioutil.ReadAll(resp.Body)
 		}
-		fmt.Printf("%sapi/trackerstatus -> %s\n", site.siteurl, string(respbody))
+		log.Printf("%sapi/trackerstatus -> %s\n", site.siteurl, string(respbody))
 		statusResponse := TrackerStatusResponse{}
 		if err == nil {
 			err = json.Unmarshal(respbody, &statusResponse)
@@ -296,8 +300,9 @@ func userSet(username string) {
 }
 
 func main() {
-	var fg bool
+	var fg, bgChild bool
 	flag.BoolVar(&fg, "fg", false, "run in foreground")
+	flag.BoolVar(&bgChild, "bg-child", false, "")
 
 	var nfiles int = nfilesGet()
 	var nfilesReq int
@@ -313,16 +318,44 @@ func main() {
 	flag.StringVar(&user, "u", "", "run as user")
 
 	var watchDirectory string
-	flag.StringVar(&watchDirectory, "update-directory", "", "directory to watch for updates")
+	flag.StringVar(&watchDirectory, "watch-directory", "", "directory to watch for updates")
 	flag.StringVar(&watchDirectory, "d", "", "directory to watch for updates")
+	flag.StringVar(&watchDirectory, "update-directory", "", "")
+
+	var pidFile string
+	flag.StringVar(&pidFile, "pid-file", "", "file to write process PID")
+
+	var logFile string
+	flag.StringVar(&logFile, "log", "", "log file")
+	flag.StringVar(&logFile, "log-file", "", "log file")
 
 	flag.Parse()
+
+	var logw io.Writer = ioutil.Discard
+	if logFile != "" {
+		logw, err := os.OpenFile(logFile, os.O_WRONLY | os.O_APPEND | os.O_CREATE, 0660)
+		if err != nil {
+			log.Fatal(err)
+		}
+		log.SetOutput(io.MultiWriter(logw, os.Stderr))
+	}
 
 	if nfiles != nfilesReq {
 		nfiles = nfilesSet(nfilesReq)
 		if nfiles < nfilesReq {
 			log.Printf("limited to %d open files\n", nfiles)
 		}
+	}
+
+	var listener net.Listener
+	var err error
+	if bgChild {
+		listener, err = net.FileListener(os.NewFile(3, "listen-fd"))
+	} else {
+		listener, err = net.Listen("tcp", fmt.Sprintf(":%d", port))
+	}
+	if err != nil {
+		log.Fatal(err)
 	}
 
 	if user != "" {
@@ -335,12 +368,48 @@ func main() {
 		go directoryWatcher(watchDirectory)
 	}
 
-	if !fg {
+	if pidFile != "" {
+		err := ioutil.WriteFile(pidFile, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0660)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+
+	if !fg && !bgChild {
+		tcpListenFd, err := listener.(*net.TCPListener).File()
+		if err != nil {
+			log.Fatal(err)
+		}
+		args := []string{"--bg-child"}
+		if logFile != "" {
+			args = append(args, "--log-file", logFile)
+		}
+		if pidFile != "" {
+			args = append(args, "--pid-file", pidFile)
+		}
+		if user != "" {
+			args = append(args, "--user", user)
+		}
+		if watchDirectory != "" {
+			args = append(args, "--watch-directory", watchDirectory)
+		}
+		cmd := exec.Command(os.Args[0], args...)
+		cmd.ExtraFiles = []*os.File{tcpListenFd}
+		if err = cmd.Start(); err != nil {
+			log.Fatal(err)
+		}
+		os.Exit(0)
+	}
+
+	if bgChild {
 		unix.Setpgid(0, 0)
 		signal.Ignore(unix.SIGHUP)
-		// XXX close stdin/stdout/stderr
+		log.SetOutput(logw)
+		os.Stdin.Close()
+		os.Stdout.Close()
+		os.Stderr.Close()
 	}
 
 	http.HandleFunc("/", SiteRequest)
-	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", port), nil))
+	log.Fatal(http.Serve(listener, nil))
 }
