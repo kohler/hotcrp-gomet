@@ -2,11 +2,16 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
+	"golang.org/x/sys/unix"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
+	"os/signal"
+	"os/user"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,24 +21,48 @@ import (
 const siteStatusTimeout = 10 * time.Second
 const siteErrorStatusTimeout = 5 * time.Second
 
+type TrackerSequencer float64
+
+func (seq TrackerSequencer) MarshalJSON() ([]byte, error) {
+	return []byte(fmt.Sprintf("%f", seq)), nil
+}
+
+
+type SiteStatus struct {
+	Status string
+	Sequencer TrackerSequencer
+	Error error
+}
+
 type Site struct {
 	siteurl string
 	createAt time.Time
 	accessAt time.Time
-	status string
-	statusError error
-	statusSequencer float64
+	status SiteStatus
 	statusSetAt time.Time
+	closed bool
 
 	mu sync.Mutex
 	statusRefreshing bool
-	statusWaiters []chan<- string
+	statusWaiters []chan<- SiteStatus
 	statusInterest int
+	statusLooper chan<- struct{}
+}
+
+func NewSite(siteurl string) *Site {
+	site := new(Site)
+	site.siteurl = siteurl
+	site.createAt = time.Now()
+	site.statusWaiters = make([]chan<- SiteStatus, 0, 8)
+	ch := make(chan struct{}, 2)
+	site.statusLooper = ch
+	go site.statusLoop(ch)
+	return site
 }
 
 func (site *Site) statusExpiry() time.Time {
 	timeout := time.Duration(siteStatusTimeout)
-	if site.status == "" {
+	if site.status.Status == "" {
 		timeout = time.Duration(siteErrorStatusTimeout)
 	}
 	return site.statusSetAt.Add(timeout)
@@ -43,11 +72,41 @@ func (site *Site) statusExpired() bool {
 	return time.Now().After(site.statusExpiry())
 }
 
+func (site *Site) statusLoop(ch <-chan struct{}) {
+	for !site.closed {
+		site.mu.Lock()
+		expiry := site.statusExpiry().Add(-2 * time.Second)
+		now := time.Now()
+		var timech <-chan time.Time
+		var statusch <-chan SiteStatus
+		if site.statusInterest == 0 {
+		} else if now.Before(expiry) {
+			timech = time.After(expiry.Sub(now))
+		} else {
+			sch := make(chan SiteStatus, 1)
+			site.statusWaiters = append(site.statusWaiters, sch)
+			go site.renewStatus()
+			statusch = sch
+		}
+		site.mu.Unlock()
+
+		select {
+		case <-timech:
+			fmt.Printf("time\n")
+		case <-statusch:
+			fmt.Printf("status\n")
+		case <-ch:
+			fmt.Printf("ping\n")
+		}
+	}
+}
+
+
 type TrackerStatusResponse struct {
 	Ok bool `json:"ok"`
 	Error string `json:"error"`
 	TrackerStatus string `json:"tracker_status"`
-	Sequencer float64 `json:"tracker_status_at"`
+	Sequencer TrackerSequencer `json:"tracker_status_at"`
 }
 
 func (site *Site) renewStatus() {
@@ -68,18 +127,17 @@ func (site *Site) renewStatus() {
 		}
 		site.mu.Lock()
 
-		site.status = ""
-		site.statusError = err
+		site.status = SiteStatus{"", 0, err}
 		site.statusSetAt = time.Now()
 		if err != nil {
 			// already have tracked error
 		} else if !statusResponse.Ok {
-			site.statusError = fmt.Errorf("%s", statusResponse.Error)
-		} else if site.status != "" && statusResponse.Sequencer < site.statusSequencer {
+			site.status.Error = fmt.Errorf("%s", statusResponse.Error)
+		} else if site.status.Status != "" && statusResponse.Sequencer < site.status.Sequencer {
 			// ignore out-of-sequence response
 		} else {
-			site.status = statusResponse.TrackerStatus
-			site.statusSequencer = statusResponse.Sequencer
+			site.status.Status = statusResponse.TrackerStatus
+			site.status.Sequencer = statusResponse.Sequencer
 		}
 
 		for _, ch := range site.statusWaiters {
@@ -92,31 +150,8 @@ func (site *Site) renewStatus() {
 	site.mu.Unlock()
 }
 
-func (site *Site) statusLoop() {
-	for {
-		site.mu.Lock()
-		if site.statusInterest == 0 {
-			site.mu.Unlock()
-			return
-		}
-
-		expiry := site.statusExpiry().Add(-2 * time.Second)
-		now := time.Now()
-		if now.Before(expiry) {
-			site.mu.Unlock()
-			<-time.After(expiry.Sub(now))
-		} else {
-			ch := make(chan string)
-			site.statusWaiters = append(site.statusWaiters, ch)
-			site.mu.Unlock()
-			go site.renewStatus()
-			<-ch
-		}
-	}
-}
-
-func (site *Site) Status() <-chan string {
-	ch := make(chan string, 1)
+func (site *Site) Status() <-chan SiteStatus {
+	ch := make(chan SiteStatus, 1)
 	site.mu.Lock()
 	if site.statusExpired() {
 		site.statusWaiters = append(site.statusWaiters, ch)
@@ -128,18 +163,18 @@ func (site *Site) Status() <-chan string {
 	return ch
 }
 
-func (site *Site) DifferentStatus(status string) <-chan string {
-	ch := make(chan string, 1)
+func (site *Site) DifferentStatus(status string) <-chan SiteStatus {
+	ch := make(chan SiteStatus, 1)
 	site.mu.Lock()
-	if site.statusExpired() || site.status == status {
+	if site.statusExpired() || site.status.Status == status {
 		site.statusInterest++
 		if site.statusInterest == 1 {
-			go site.statusLoop()
+			site.statusLooper <- struct{}{}
 		}
 		go func() {
-			lch := make(chan string)
+			lch := make(chan SiteStatus, 1)
 			site.mu.Lock()
-			for site.statusExpired() || site.status == status {
+			for site.statusExpired() || site.status.Status == status {
 				site.statusWaiters = append(site.statusWaiters, lch)
 				site.mu.Unlock()
 				<-lch
@@ -183,15 +218,11 @@ func LookupSite(s, host string) (*Site, error) {
 
 	sitemapmu.Lock()
 	site := sitemap[siteurl]
-	now := time.Now()
 	if site == nil {
-		site = new(Site)
-		site.siteurl = siteurl
-		site.createAt = now
-		site.statusWaiters = make([]chan<- string, 0, 8)
+		site = NewSite(siteurl)
 		sitemap[siteurl] = site
 	}
-	site.accessAt = now
+	site.accessAt = time.Now()
 	sitemapmu.Unlock()
 
 	return site, nil
@@ -200,28 +231,111 @@ func LookupSite(s, host string) (*Site, error) {
 
 type SiteResponse struct {
 	Ok bool `json:"ok"`
+	Status string `json:"tracker_status,omitempty"`
+	Sequencer TrackerSequencer `json:"tracker_status_at,omitempty"`
 	Error string `json:"error,omitempty"`
 	Message string `json:"message,omitempty"`
 }
 
 func SiteRequest(w http.ResponseWriter, req *http.Request) {
+	w.Header().Add("Access-Control-Allow-Origin", "*")
+	w.Header().Add("Access-Control-Allow-Credentials", "true")
+	w.Header().Add("Access-Control-Allow-Headers", "Accept-Encoding")
+	w.Header().Add("Expires", "Mon, 26 Jul 1997 05:00:00 GMT")
 	var result SiteResponse
+	var status SiteStatus
 	if site, err := LookupSite(req.FormValue("conference"), req.Host); err != nil {
-		result.Error = err.Error()
+		status = SiteStatus{Error: err}
 	} else if poll := req.FormValue("poll"); poll != "" {
-		status := <-site.DifferentStatus(poll)
-		result.Message = "status " + status
-		result.Ok = status != ""
+		status = <-site.DifferentStatus(poll)
 	} else {
-		status := <-site.Status()
-		result.Message = "status " + status
-		result.Ok = status != ""
+		status = <-site.Status()
+	}
+	if status.Error == nil {
+		result.Ok = true
+		result.Status = status.Status
+		result.Sequencer = status.Sequencer
+	} else {
+		result.Error = status.Error.Error()
 	}
 	data, _ := json.Marshal(result)
 	w.Write(data)
 }
 
+
+func nfilesGet() int {
+	var rlimit unix.Rlimit
+	_ = unix.Getrlimit(unix.RLIMIT_NOFILE, &rlimit)
+	return int(rlimit.Cur)
+}
+
+func nfilesSet(n int) int {
+	var rlimit unix.Rlimit
+	_ = unix.Getrlimit(unix.RLIMIT_NOFILE, &rlimit)
+	if n <= 0 {
+		rlimit.Cur = rlimit.Max
+	} else if uint64(n) < rlimit.Max {
+		rlimit.Cur = uint64(n)
+	}
+	_ = unix.Setrlimit(unix.RLIMIT_NOFILE, &rlimit)
+	return nfilesGet()
+}
+
+func userSet(username string) {
+	u, err := user.Lookup(username)
+	if err != nil {
+		log.Fatalf("%s", err)
+	}
+
+	gid, _ := strconv.Atoi(u.Gid)
+	err = unix.Setgid(gid)
+	if err != nil {
+		log.Fatalf("%s", err)
+	}
+
+	uid, _ := strconv.Atoi(u.Uid)
+	err = unix.Setuid(uid)
+	if err != nil {
+		log.Fatalf("%s", err)
+	}
+}
+
 func main() {
+	var fg bool
+	flag.BoolVar(&fg, "fg", false, "run in foreground")
+
+	var nfiles int = nfilesGet()
+	var nfilesReq int
+	flag.IntVar(&nfilesReq, "nfiles", nfiles, "maximum number of files")
+	flag.IntVar(&nfilesReq, "n", nfiles, "maximum number of files")
+
+	var port int = 20444
+	flag.IntVar(&port, "port", port, "listening port")
+	flag.IntVar(&port, "p", port, "listening port")
+
+	var user string
+	flag.StringVar(&user, "user", "", "run as user")
+	flag.StringVar(&user, "u", "", "run as user")
+
+	flag.Parse()
+
+	if nfiles != nfilesReq {
+		nfiles = nfilesSet(nfilesReq)
+		if nfiles < nfilesReq {
+			log.Printf("limited to %d open files\n", nfiles)
+		}
+	}
+
+	if user != "" {
+		userSet(user)
+	}
+
+	if !fg {
+		unix.Setpgid(0, 0)
+		signal.Ignore(unix.SIGHUP)
+		// XXX close stdin/stdout/stderr
+	}
+
 	http.HandleFunc("/", SiteRequest)
-	log.Fatal(http.ListenAndServe("localhost:20444", nil))
+	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", port), nil))
 }
