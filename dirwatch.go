@@ -33,6 +33,7 @@ func DirectoryWatcher(dir string) {
 	}
 }
 
+
 type TrackerStatusUpdate struct {
 	Conference string `json:"conference"`
 	TrackerStatus string `json:"tracker_status"`

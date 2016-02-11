@@ -28,16 +28,16 @@ const siteErrorStatusTimeout = 5 * time.Second
 var directoryWatcher func(string)
 
 
-type TrackerSequencer float64
+type TrackerSeq float64
 
-func (seq TrackerSequencer) MarshalJSON() ([]byte, error) {
+func (seq TrackerSeq) MarshalJSON() ([]byte, error) {
 	return []byte(fmt.Sprintf("%f", seq)), nil
 }
 
 
 type SiteStatus struct {
 	Status string
-	Sequencer TrackerSequencer
+	Seq TrackerSeq
 	Error error
 }
 
@@ -102,7 +102,7 @@ type TrackerStatusResponse struct {
 	Ok bool `json:"ok"`
 	Error string `json:"error"`
 	TrackerStatus string `json:"tracker_status"`
-	Sequencer TrackerSequencer `json:"tracker_status_at"`
+	Seq TrackerSeq `json:"tracker_status_at"`
 }
 
 func (site *Site) renewStatus() {
@@ -126,7 +126,7 @@ func (site *Site) renewStatus() {
 		newStatus := SiteStatus{"", 0, err}
 		if err == nil && statusResponse.Ok {
 			newStatus.Status = statusResponse.TrackerStatus
-			newStatus.Sequencer = statusResponse.Sequencer
+			newStatus.Seq = statusResponse.Seq
 		} else if err == nil {
 			newStatus.Error = fmt.Errorf("%s", statusResponse.Error)
 		}
@@ -137,7 +137,7 @@ func (site *Site) renewStatus() {
 }
 
 func (site *Site) Update(newStatus SiteStatus) {
-	if newStatus.Error != nil || site.status.Status == "" || site.status.Sequencer < newStatus.Sequencer {
+	if newStatus.Error != nil || site.status.Status == "" || site.status.Seq < newStatus.Seq {
 		site.status = newStatus
 	}
 	site.statusSetAt = time.Now()
@@ -161,29 +161,45 @@ func (site *Site) Status() <-chan SiteStatus {
 	return ch
 }
 
-func (site *Site) DifferentStatus(status string) <-chan SiteStatus {
+func (site *Site) statusDefinitelyDiffers(status SiteStatus) bool {
+	return !site.statusExpired() &&
+		status.Status != site.status.Status &&
+		status.Seq <= site.status.Seq
+}
+
+func (site *Site) DifferentStatus(status SiteStatus, timeout time.Duration) <-chan SiteStatus {
 	ch := make(chan SiteStatus, 1)
 	site.mu.Lock()
-	if site.statusExpired() || site.status.Status == status {
+	if site.statusDefinitelyDiffers(status) {
+		ch <- site.status
+	} else {
 		site.statusInterest++
 		if site.statusInterest == 1 {
 			site.statusLooper <- struct{}{}
 		}
+		var timeoutch <-chan time.Time
+		if timeout > 0 {
+			timeoutch = time.After(timeout)
+		}
 		go func() {
 			lch := make(chan SiteStatus, 1)
+			timedout := false
 			site.mu.Lock()
-			for site.statusExpired() || site.status.Status == status {
+			for !site.statusDefinitelyDiffers(status) && !timedout {
 				site.statusWaiters = append(site.statusWaiters, lch)
 				site.mu.Unlock()
-				<-lch
+				select {
+				case <-lch:
+					status.Seq = 0
+				case <-timeoutch:
+					timedout = true
+				}
 				site.mu.Lock()
 			}
 			site.statusInterest--
 			ch <- site.status
 			site.mu.Unlock()
 		}()
-	} else {
-		ch <- site.status
 	}
 	site.mu.Unlock()
 	return ch
@@ -232,35 +248,67 @@ func LookupSite(s, host string, create bool) (*Site, error) {
 type SiteResponse struct {
 	Ok bool `json:"ok"`
 	Status string `json:"tracker_status,omitempty"`
-	Sequencer TrackerSequencer `json:"tracker_status_at,omitempty"`
+	Seq TrackerSeq `json:"tracker_status_at,omitempty"`
 	Error string `json:"error,omitempty"`
 	Message string `json:"message,omitempty"`
 }
 
-func SiteRequest(w http.ResponseWriter, req *http.Request) {
+func outputResponse(w http.ResponseWriter, result interface{}) {
 	w.Header().Add("Access-Control-Allow-Origin", "*")
 	w.Header().Add("Access-Control-Allow-Credentials", "true")
 	w.Header().Add("Access-Control-Allow-Headers", "Accept-Encoding")
 	w.Header().Add("Expires", "Mon, 26 Jul 1997 05:00:00 GMT")
+	data, _ := json.Marshal(result)
+	w.Write(data)
+}
+
+func PollRequest(w http.ResponseWriter, req *http.Request) {
 	var result SiteResponse
 	var status SiteStatus
 	site, err := LookupSite(req.FormValue("conference"), req.Host, true)
 	if err != nil {
 		status = SiteStatus{Error: err}
 	} else if poll := req.FormValue("poll"); poll != "" {
-		status = <-site.DifferentStatus(poll)
+		status = SiteStatus{Status: poll}
+		if x, err := strconv.ParseFloat(req.FormValue("tracker_status_at"), 64); err == nil {
+			status.Seq = TrackerSeq(x)
+		}
+		var timeout time.Duration
+		if x, err := strconv.ParseFloat(req.FormValue("timeout"), 64); err == nil {
+			timeout = time.Duration(x * float64(time.Millisecond))
+		}
+		status = <-site.DifferentStatus(status, timeout)
 	} else {
 		status = <-site.Status()
 	}
 	if status.Error == nil {
 		result.Ok = true
 		result.Status = status.Status
-		result.Sequencer = status.Sequencer
+		result.Seq = status.Seq
 	} else {
 		result.Error = status.Error.Error()
 	}
-	data, _ := json.Marshal(result)
-	w.Write(data)
+	outputResponse(w, result)
+}
+
+func UpdateRequest(w http.ResponseWriter, req *http.Request) {
+	var result SiteResponse
+	site, err := LookupSite(req.FormValue("conference"), req.Host, true)
+	if err != nil {
+		result = SiteResponse{Ok: false, Error: err.Error()}
+	} else if status := req.FormValue("tracker_status"); status != "" {
+		status := SiteStatus{Status: status}
+		if x, err := strconv.ParseFloat(req.FormValue("tracker_status_at"), 64); err == nil {
+			status.Seq = TrackerSeq(x)
+		}
+		site.mu.Lock()
+		site.Update(status)
+		site.mu.Unlock()
+		result = SiteResponse{Ok: true}
+	} else {
+		result = SiteResponse{Ok: false, Error: fmt.Sprintf("bad status update")}
+	}
+	outputResponse(w, result)
 }
 
 
@@ -410,6 +458,7 @@ func main() {
 		os.Stderr.Close()
 	}
 
-	http.HandleFunc("/", SiteRequest)
+	http.HandleFunc("/poll", PollRequest)
+	http.HandleFunc("/update", UpdateRequest)
 	log.Fatal(http.Serve(listener, nil))
 }
