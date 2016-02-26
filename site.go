@@ -100,13 +100,11 @@ func (site *Site) renewStatus() {
         site.statusRefreshing = true
         site.mu.Unlock()
 
-        log.Printf("%sapi/trackerstatus -> ...\n", site.siteurl)
         resp, err := http.Get(site.siteurl + "api.php?fn=trackerstatus")
         var respbody []byte
         if err == nil {
             respbody, err = ioutil.ReadAll(resp.Body)
         }
-        log.Printf("%sapi/trackerstatus -> %s\n", site.siteurl, string(respbody))
         statusResponse := TrackerStatusResponse{}
         if err == nil {
             err = json.Unmarshal(respbody, &statusResponse)
